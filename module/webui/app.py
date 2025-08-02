@@ -1,13 +1,18 @@
 import re
-import argparse
+import sys
 import json
+import time
+import queue
+import argparse
+import re
+import json
+import os
 import queue
 import threading
 import time
 from datetime import datetime
 from functools import partial
 from typing import Dict, List, Optional
-
 # Import fake module before import pywebio to avoid importing unnecessary module PIL
 from module.webui.fake_pil_module import import_fake_pil_module
 
@@ -55,6 +60,7 @@ from module.config.utils import (
 from module.config.utils import time_delta
 from module.log_res.log_res import LogRes
 from module.logger import logger
+from module.notify import handle_notify
 from module.ocr.rpc import start_ocr_server_process, stop_ocr_server_process
 from module.submodule.submodule import load_config
 from module.submodule.utils import get_config_mod
@@ -66,6 +72,7 @@ from module.webui.patch import patch_executor, patch_mimetype
 from module.webui.pin import put_input, put_select
 from module.webui.process_manager import ProcessManager
 from module.webui.remote_access import RemoteAccess
+from module.webui.restart_tracker import get_restart_count, set_restart_count, reset_restart_count
 from module.webui.setting import State
 from module.webui.updater import updater
 from module.webui.utils import (
@@ -537,7 +544,7 @@ class AlasGUI(Frame):
             self.task_handler.add(self.alas_update_dashboard, 10, True)
         self.task_handler.add(log.put_log(self.alas), 0.25, True)
 
-    def set_dashboard_display(self, b = False):
+    def set_dashboard_display(self, b):
         self._log.set_dashboard_display(b)
         self.alas_update_dashboard(True)
 
@@ -577,6 +584,7 @@ class AlasGUI(Frame):
             config_updater: AzurLaneConfig = State.config_updater,
     ) -> None:
         try:
+            skip_time_record = False
             valid = []
             invalid = []
             config = config_updater.read_file(config_name)
@@ -1097,17 +1105,17 @@ class AlasGUI(Frame):
     def dev_utils(self) -> None:
         self.init_menu(name="Utils")
         self.set_title(t("Gui.MenuDevelop.Utils"))
-        put_button(label="Raise exception", onclick=raise_exception)
+        put_button(label=t("Gui.MenuDevelop.RaiseException"), onclick=raise_exception)
 
         def _force_restart():
             if State.restart_event is not None:
-                toast("Alas will restart in 3 seconds", duration=0, color="error")
+                toast(t("Gui.Toast.AlasRestart"), duration=0, color="error")
                 clearup()
                 State.restart_event.set()
             else:
-                toast("Reload not enabled", color="error")
+                toast(t("Gui.Toast.ReloadEnabled"), color="error")
 
-        put_button(label="Force restart", onclick=_force_restart)
+        put_button(label=t("Gui.MenuDevelop.ForceRestart"), onclick=_force_restart)
 
     @use_scope("content", clear=True)
     def dev_remote(self) -> None:
@@ -1614,6 +1622,50 @@ def clearup():
     logger.info("Alas closed.")
 
 
+g_instance_watcher: threading.Thread = None
+g_instance_restart_too_many_times: List[str]
+
+def instance_watcher_thread():
+    global g_instance_restart_too_many_times
+    while True:
+        time.sleep(10)
+        try:
+            for instance in alas_instance():
+                ins = ProcessManager.get_manager(instance)
+                config = AzurLaneConfig(ins.config_name)
+
+                enabled = deep_get(config.data, "Restart.InstanceRestart.Enabled", False)
+                if not enabled:
+                    continue
+
+                if ins.state == 3 and not ins.alive:
+                    attempts = deep_get(config.data, "Restart.InstanceRestart.AttemptsToRestart", 3)
+                    has_restarted = get_restart_count(ins.config_name)
+                    enable_notify = deep_get(config.data, "Restart.InstanceRestart.NotifyWhenAutoRestart", False)
+                    push_config = deep_get(config.data, "Alas.Error.OnePushConfig")
+
+                    if has_restarted < attempts:
+                        ins.start("alas")
+                        set_restart_count(ins.config_name, has_restarted + 1)
+                        
+                        if enable_notify:
+                            handle_notify(
+                                push_config,
+                                title=f"Alas <{ins.config_name}> instance auto restarted",
+                                content=f"Critical error occurred, instance restarted",
+                            )
+                    else:
+                        if ins.config_name not in g_instance_restart_too_many_times:
+                            g_instance_restart_too_many_times.append(ins.config_name)
+                            reset_restart_count(ins.config_name)
+                            handle_notify(
+                                push_config,
+                                title=f"Alas <{ins.config_name}> instance disabled due to too many restarts",
+                                content="The instance exceeded the max restart attempts and is now disabled.",
+                            )
+        except:
+            ...
+
 def app():
     parser = argparse.ArgumentParser(description="Alas web service")
     parser.add_argument(
@@ -1655,6 +1707,11 @@ def app():
 
     from deploy.atomic import atomic_failure_cleanup
     atomic_failure_cleanup('./config')
+
+    global g_instance_watcher
+    if g_instance_watcher is None:
+        g_instance_watcher = threading.Thread(target=instance_watcher_thread)
+        g_instance_watcher.start()
 
     def index():
         if key is not None and not login(key):

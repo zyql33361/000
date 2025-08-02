@@ -1,45 +1,9 @@
 from module.gg_handler.gg_data import GGData
 from module.gg_handler.gg_u2 import GGU2
 # from module.gg_handler.gg_screenshot import GGScreenshot
+from module.config.utils import deep_get, deep_set
 from module.logger import logger
 from module.base.timer import timeout
-import module.config.utils as utils
-
-# 如果 utils 模块中没有 deep_get 和 deep_set，则动态定义并注入
-if not (hasattr(utils, 'deep_get') and hasattr(utils, 'deep_set')):
-    def deep_get(d, keys, default=None):
-        """
-        递归安全地获取嵌套字典的值
-        """
-        if isinstance(keys, str):
-            keys = keys.split('.')
-        assert isinstance(keys, list)
-        if d is None:
-            return default
-        if not keys:
-            return d
-        return deep_get(d.get(keys[0]), keys[1:], default)
-
-    def deep_set(d, keys, value):
-        """
-        递归安全地设置嵌套字典的值
-        """
-        if isinstance(keys, str):
-            keys = keys.split('.')
-        assert isinstance(keys, list)
-        if not keys:
-            return value
-        if not isinstance(d, dict):
-            d = {}
-        d[keys[0]] = deep_set(d.get(keys[0], {}), keys[1:], value)
-        return d
-
-    # 将定义好的函数添加到 utils 模块中
-    utils.deep_get = deep_get
-    utils.deep_set = deep_set
-
-# 然后再从 utils 模块导入 deep_get 和 deep_set
-from module.config.utils import deep_get, deep_set
 
 
 class GGHandler:
@@ -49,8 +13,6 @@ class GGHandler:
         config: AzurlaneConfig
         device: Device
     """
-
-       
 
     def __init__(self, config=None, device=None):
         self.config = config
@@ -66,20 +28,21 @@ class GGHandler:
         from module.handler.login import LoginHandler
         from module.exception import GameStuckError
         _crashed = crashed
-        attempt_count = 0 
-        while True:  # 使用无限循环
+        for _ in range(2):
             try:
+                if _crashed:
+                    timeout(self.handle_u2_restart, timeout_sec=60)
                 if not timeout(LoginHandler(config=self.config, device=self.device).app_restart, timeout_sec=600):
-                    logger.info(f"Game restarted successfully after {attempt_count + 1} attempts.")
                     break
                 raise RuntimeError
-            except (GameStuckError) as e:
-                logger.error(f"Game restart failed on attempt {attempt_count + 1}: {e}. Retrying...")
+            except GameStuckError as e:
+                pass
             except Exception as e:
                 logger.exception(e)
-            attempt_count += 1
-            logger.info(f"Restart attempt {attempt_count} failed. Retrying after a delay...")
-            time.sleep(5)
+                if _crashed:
+                    logger.critical('Maybe your emulator died, trying to restart it')
+                    self.device.emulator_start()
+                _crashed = True
 
     def set(self, mode=True):
         """
